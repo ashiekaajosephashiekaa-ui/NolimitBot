@@ -1,6 +1,5 @@
 // ============================================================
-// NooLimit — Telegram Mini App + Bot with unlimited tasks
-// Bot: @NoolimitsBot
+// NooLimit — Telegram Mini App + Bot with REAL task verification
 // ============================================================
 
 const crypto = require('crypto');
@@ -10,63 +9,137 @@ const LOGO_URL = 'https://iili.io/nuLWzp2.jpg';
 const BOT_USERNAME = 'NoolimitsBot';
 const BRAND_DARK = '#0b0e14';
 
-// ---------- Storage (in-memory — resets on cold start) ----------
-const USERS = new Map();
-function getUser(id) { return USERS.get(String(id)) || null; }
-function saveUser(id, u) { USERS.set(String(id), u); return u; }
+// ============================================================
+// STORAGE — Upstash Redis (recommended) with in-memory fallback
+// ============================================================
+const R_URL = process.env.UPSTASH_REDIS_REST_URL;
+const R_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
+const HAS_REDIS = !!(R_URL && R_TOKEN);
+
+async function redis(cmd) {
+  if (!HAS_REDIS) return null;
+  try {
+    const res = await fetch(R_URL, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${R_TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(cmd),
+    });
+    const j = await res.json();
+    return j.result;
+  } catch (e) { console.error('redis', e); return null; }
+}
+
+const MEM = new Map();
+
+async function getUser(id) {
+  if (HAS_REDIS) {
+    const v = await redis(['GET', `u:${id}`]);
+    if (!v) return null;
+    try { return typeof v === 'string' ? JSON.parse(v) : v; } catch { return null; }
+  }
+  return MEM.get(String(id)) || null;
+}
+async function saveUser(id, u) {
+  if (HAS_REDIS) return redis(['SET', `u:${id}`, JSON.stringify(u)]);
+  MEM.set(String(id), u);
+  return u;
+}
+async function userCount() {
+  if (HAS_REDIS) {
+    const keys = await redis(['KEYS', 'u:*']);
+    return Array.isArray(keys) ? keys.length : 0;
+  }
+  return MEM.size;
+}
+async function allIds() {
+  if (HAS_REDIS) {
+    const keys = await redis(['KEYS', 'u:*']);
+    return (keys || []).map(k => k.replace('u:', ''));
+  }
+  return [...MEM.keys()];
+}
 
 function newUser(p) {
   return {
     id: p.id, username: p.username || '', first_name: p.first_name || '',
     balance: 0, level: 1, xp: 0,
     referrals: 0, referredBy: null,
-    tasks: {},            // { taskId: { count, lastAt } }
-    lastDaily: 0, streak: 0,
+    tasks: {}, lastDaily: 0, streak: 0,
     createdAt: Date.now(),
   };
 }
-function createUser(p) {
-  return getUser(p.id) || saveUser(p.id, newUser(p));
+async function getOrCreate(p) {
+  let u = await getUser(p.id);
+  if (!u) { u = newUser(p); await saveUser(p.id, u); }
+  return u;
 }
 
 // ============================================================
-// TASKS — add as many as you want
-// type: 'once' | 'daily' | 'cooldown' | 'unlimited'
+// TASKS — each one requires REAL user action to complete
+// type:
+//   'channel'   — bot verifies via getChatMember
+//   'timer'     — user must wait N seconds (real countdown)
+//   'link'      — user opens URL, then waits 5s, then verifies
+//   'instant'   — daily check-in / open (1 tap = done, daily reset)
+//   'unlimited' — repeatable tap task with hourly cap
 // ============================================================
+
+// 🔧 CONFIGURE YOUR CHANNELS HERE (must be public or bot must be admin)
+const CHANNELS = {
+  main: '@telegram',           // ← replace with your channel username
+  news: '@durov',              // ← replace with your channel username
+};
+
 const TASKS = [
-  // ---------- ONE-TIME ----------
-  { id: 'follow_x',    type: 'once', reward: 30, title: 'Follow us on X',      desc: 'Open our X profile and follow.',        icon: '🐦', url: 'https://x.com/' },
-  { id: 'join_chan',   type: 'once', reward: 40, title: 'Join our channel',    desc: 'Join the announcement channel.',        icon: '📢', url: 'https://t.me/' },
-  { id: 'visit_site',  type: 'once', reward: 20, title: 'Visit our website',   desc: 'Open our site and look around.',        icon: '🌐', url: 'https://t.me/' },
-  { id: 'read_about',  type: 'once', reward: 15, title: 'Read About page',     desc: 'Open About and read the policy.',       icon: '📖' },
-  { id: 'rate_bot',    type: 'once', reward: 25, title: 'Rate the bot',        desc: 'Send us your feedback via the bot.',    icon: '⭐' },
-  { id: 'enable_notif',type: 'once', reward: 20, title: 'Enable notifications',desc: 'Turn on alerts to catch new rewards.',  icon: '🔔' },
-  { id: 'complete_prof',type:'once', reward: 15, title: 'Complete your profile',desc:'Add a username in Telegram settings.', icon: '👤' },
-  { id: 'first_share', type: 'once', reward: 35, title: 'Share NooLimit once', desc: 'Share the bot with a friend.',          icon: '📤' },
+  // ---- CHANNEL JOINS (real verification) ----
+  { id: 'ch_main',    type: 'channel', channel: CHANNELS.main, reward: 50, title: 'Join our main channel', icon: '📢', desc: 'Bot verifies you actually joined.' },
+  { id: 'ch_news',    type: 'channel', channel: CHANNELS.news, reward: 40, title: 'Join announcements',    icon: '📣', desc: 'Bot verifies you actually joined.' },
 
-  // ---------- DAILY (reset every 24h) ----------
-  { id: 'd_checkin',   type: 'daily', reward: 10, title: 'Daily check-in',      desc: 'Claim a small reward every day.',       icon: '📅' },
-  { id: 'd_open_app',  type: 'daily', reward: 5,  title: 'Open the app',        desc: 'Just open NooLimit once a day.',        icon: '🚀' },
-  { id: 'd_3ads',      type: 'daily', reward: 45, title: 'Watch 3 bonus ads',   desc: 'Watch any 3 bonus ads today.',          icon: '🎬' },
-  { id: 'd_read_board',type: 'daily', reward: 15, title: 'Check leaderboard',   desc: 'Open the leaderboard tab.',             icon: '🏆' },
-  { id: 'd_send_msg',  type: 'daily', reward: 10, title: 'Send a message',      desc: 'Send any command to the bot.',          icon: '💬' },
-  { id: 'd_browse',    type: 'daily', reward: 8,  title: 'Browse for 30s',      desc: 'Keep the app open 30 seconds.',         icon: '⏱️' },
+  // ---- TIMER TASKS (must wait for real) ----
+  { id: 'tm_30',      type: 'timer', seconds: 30, reward: 25, title: 'Stay 30 seconds',   icon: '⏱️', desc: 'Keep this screen open — countdown must finish.' },
+  { id: 'tm_60',      type: 'timer', seconds: 60, reward: 50, title: 'Stay 60 seconds',   icon: '⏳', desc: 'Keep this screen open — countdown must finish.' },
+  { id: 'tm_120',     type: 'timer', seconds: 120, reward: 100, title: 'Stay 2 minutes',   icon: '🕐', desc: 'Keep this screen open — long but big reward.' },
 
-  // ---------- COOLDOWN (repeatable with timer) ----------
-  { id: 'c_ad',        type: 'cooldown', cooldown: 90,    reward: 25, title: 'Watch a bonus ad',     desc: 'Earn NL for watching a short ad.',  icon: '🎬' },
-  { id: 'c_stay30',    type: 'cooldown', cooldown: 300,   reward: 15, title: 'Stay 30 seconds',      desc: 'Keep the app open for 30s.',        icon: '⏱️' },
-  { id: 'c_stay60',    type: 'cooldown', cooldown: 600,   reward: 30, title: 'Stay 60 seconds',      desc: 'Keep the app open for 60s.',        icon: '⏳' },
-  { id: 'c_click',     type: 'cooldown', cooldown: 180,   reward: 10, title: 'Quick tap challenge',  desc: 'Tap to claim a small reward.',      icon: '👆' },
-  { id: 'c_support',   type: 'cooldown', cooldown: 900,   reward: 20, title: 'Support us',           desc: 'Share or invite to earn NL.',       icon: '💚' },
-  { id: 'c_daily_roll',type: 'cooldown', cooldown: 3600,  reward: 12, title: 'Hourly bonus',         desc: 'Claim once per hour.',              icon: '⌛' },
-  { id: 'c_visit_p',   type: 'cooldown', cooldown: 600,   reward: 18, title: 'Visit partner site',   desc: 'Open our partner and come back.',   icon: '🔗', url: 'https://t.me/' },
+  // ---- LINK TASKS (open + verify) ----
+  { id: 'lk_x',       type: 'link', url: 'https://x.com/',      wait: 5, reward: 30, title: 'Visit our X profile', icon: '🐦', desc: 'Opens X, come back, tap Verify.' },
+  { id: 'lk_web',     type: 'link', url: 'https://telegram.org', wait: 5, reward: 20, title: 'Visit our website',   icon: '🌐', desc: 'Opens site, come back, tap Verify.' },
 
-  // ---------- UNLIMITED (soft per-hour limit) ----------
-  { id: 'u_invite',    type: 'unlimited', hourly: 20, reward: 50, title: 'Invite a friend',      desc: 'Get 50 NL when a friend joins.',    icon: '🎁' },
-  { id: 'u_share',     type: 'unlimited', hourly: 5,  reward: 20, title: 'Share NooLimit',       desc: 'Share the bot link anywhere.',      icon: '📤' },
-  { id: 'u_post',      type: 'unlimited', hourly: 3,  reward: 15, title: 'Post in channel',      desc: 'Post in the community channel.',    icon: '📝' },
-  { id: 'u_tap',       type: 'unlimited', hourly: 60, reward: 1,  title: 'Tap for 1 NL',         desc: 'Tiny reward, 60x per hour.',        icon: '👊' },
+  // ---- INSTANT DAILY ----
+  { id: 'in_checkin', type: 'instant', daily: true, reward: 15, title: 'Daily check-in', icon: '📅', desc: 'One tap, resets every 24h.' },
+
+  // ---- UNLIMITED ----
+  { id: 'un_tap',     type: 'unlimited', hourly: 100, reward: 1, title: 'Tap for 1 NL', icon: '👊', desc: 'Up to 100 taps per hour.' },
+  { id: 'un_share',   type: 'unlimited', hourly: 5, reward: 20, title: 'Share NooLimit', icon: '📤', desc: 'Share link. Max 5/hour.' },
 ];
+
+// ---------- Task status ----------
+function taskStatus(user, t) {
+  const s = user.tasks[t.id] || { count: 0, lastAt: 0, recent: [] };
+  const now = Date.now();
+
+  if (t.type === 'channel') {
+    // actual check happens server-side when verify is called
+    const done = s.count > 0;
+    return { done, ready: !done, nextAt: 0 };
+  }
+  if (t.type === 'timer' || t.type === 'link') {
+    const done = s.count > 0;
+    return { done, ready: !done, nextAt: 0 };
+  }
+  if (t.type === 'instant') {
+    const DAY = 86400000;
+    const elapsed = now - (s.lastAt || 0);
+    const ready = elapsed >= DAY;
+    return { done: false, ready, nextAt: ready ? 0 : s.lastAt + DAY };
+  }
+  if (t.type === 'unlimited') {
+    const hourAgo = now - 3600000;
+    const recent = (s.recent || []).filter(x => x > hourAgo);
+    const ready = recent.length < t.hourly;
+    return { done: false, ready, nextAt: ready ? 0 : (recent[0] + 3600000), recentCount: recent.length };
+  }
+  return { done: false, ready: true, nextAt: 0 };
+}
 
 // ---------- Telegram helpers ----------
 function tgUrl(m) { return `https://api.telegram.org/bot${process.env.BOT_TOKEN}/${m}`; }
@@ -104,34 +177,22 @@ function publicUser(u) {
   };
 }
 
-// Determine if a task is currently available + time until next
-function taskStatus(user, task) {
-  const s = user.tasks[task.id] || { count: 0, lastAt: 0 };
-  const now = Date.now();
-
-  if (task.type === 'once') {
-    return { done: s.count > 0, ready: s.count === 0, nextAt: 0 };
+// ---------- Real channel verification ----------
+async function checkChannelMembership(userId, channel) {
+  try {
+    const r = await fetch(tgUrl('getChatMember'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: channel, user_id: userId }),
+    });
+    const j = await r.json();
+    if (!j.ok) return { ok: false, error: j.description || 'Bot cannot check this channel. Add the bot as admin.' };
+    const status = j.result?.status;
+    const isMember = ['creator', 'administrator', 'member'].includes(status);
+    return { ok: true, isMember };
+  } catch (e) {
+    return { ok: false, error: 'Network error' };
   }
-  if (task.type === 'daily') {
-    const DAY = 86400000;
-    const elapsed = now - (s.lastAt || 0);
-    const ready = elapsed >= DAY;
-    return { done: false, ready, nextAt: ready ? 0 : (s.lastAt + DAY) };
-  }
-  if (task.type === 'cooldown') {
-    const cd = (task.cooldown || 60) * 1000;
-    const elapsed = now - (s.lastAt || 0);
-    const ready = elapsed >= cd;
-    return { done: false, ready, nextAt: ready ? 0 : (s.lastAt + cd) };
-  }
-  if (task.type === 'unlimited') {
-    // soft hourly rate limit
-    const hourAgo = now - 3600000;
-    const recent = (s.recent || []).filter(t => t > hourAgo);
-    const ready = recent.length < (task.hourly || 10);
-    return { done: false, ready, nextAt: ready ? 0 : (recent[0] + 3600000) };
-  }
-  return { done: false, ready: true, nextAt: 0 };
 }
 
 // ============================================================
@@ -146,7 +207,7 @@ async function handleBot(update) {
   const text = (update.message?.text || '').trim();
   const cmd = text.split(' ')[0].toLowerCase();
   const WEBAPP_URL = process.env.WEBAPP_URL || `https://${BOT_USERNAME.toLowerCase()}.netlify.app`;
-  const user = createUser(from);
+  const user = await getOrCreate(from);
 
   const launchBtn = {
     inline_keyboard: [[{ text: `🚀 Launch ${APP_NAME}`, web_app: { url: WEBAPP_URL } }]],
@@ -155,10 +216,10 @@ async function handleBot(update) {
   if (cmd === '/start') {
     const ref = text.match(/ref_(\d+)/);
     if (ref && !user.referredBy && Number(ref[1]) !== from.id) {
-      const r = getUser(Number(ref[1]));
+      const r = await getUser(Number(ref[1]));
       if (r) {
-        r.balance += 50; r.referrals += 1; saveUser(r.id, r);
-        user.referredBy = r.id; user.balance += 25; saveUser(user.id, user);
+        r.balance += 50; r.referrals = (r.referrals || 0) + 1; await saveUser(r.id, r);
+        user.referredBy = r.id; user.balance += 25; await saveUser(user.id, user);
         tg('sendMessage', { chat_id: r.id, text: '🎉 New referral! +50 NL' });
       }
     }
@@ -166,7 +227,7 @@ async function handleBot(update) {
       chat_id: chatId,
       text:
         `👋 Welcome to *${APP_NAME}*, ${from.first_name}!\n\n` +
-        `Open the Mini App to see all tasks, bonuses, and rewards.\n\n` +
+        `Open the Mini App to see tasks and rewards.\n\n` +
         `_Points have no cash value — entertainment only._`,
       parse_mode: 'Markdown',
       reply_markup: launchBtn,
@@ -179,23 +240,6 @@ async function handleBot(update) {
       text: `💰 Balance: *${user.balance} NL*\n🏆 Level: ${user.level}\n⚡ XP: ${user.xp}`,
       parse_mode: 'Markdown',
       reply_markup: launchBtn,
-    });
-  }
-
-  if (cmd === '/daily') {
-    const now = Date.now(), DAY = 86400000;
-    if (now - user.lastDaily < DAY) {
-      const h = Math.ceil((DAY - (now - user.lastDaily)) / 3600000);
-      return tg('sendMessage', { chat_id: chatId, text: `⏳ Come back in ~${h}h.` });
-    }
-    user.streak = now - user.lastDaily < DAY * 2 ? user.streak + 1 : 1;
-    user.lastDaily = now;
-    const reward = 10 + user.streak * 5;
-    user.balance += reward;
-    saveUser(user.id, user);
-    return tg('sendMessage', {
-      chat_id: chatId,
-      text: `✅ Daily claimed! +${reward} NL\n🔥 Streak: ${user.streak}`,
     });
   }
 
@@ -213,8 +257,8 @@ async function handleBot(update) {
       chat_id: chatId,
       text:
         `*${APP_NAME} Commands*\n\n` +
-        `/start – Register\n/balance – Balance\n/daily – Daily reward\n` +
-        `/invite – Referral link\n/tasks – Open app\n/help – Menu\n\n` +
+        `/start – Register\n/balance – Balance\n/invite – Referral link\n` +
+        `/tasks – Open app\n/help – Menu\n\n` +
         `NL is an in-app token with no monetary value.`,
       parse_mode: 'Markdown',
       reply_markup: launchBtn,
@@ -225,27 +269,21 @@ async function handleBot(update) {
     return tg('sendMessage', { chat_id: chatId, text: '🎯 Open the Mini App:', reply_markup: launchBtn });
   }
 
-  if (cmd === '/admin' && String(from.id) === process.env.ADMIN_ID) {
-    return tg('sendMessage', {
-      chat_id: chatId,
-      text: `*Admin*\n/broadcast <msg>\n/stats`,
-      parse_mode: 'Markdown',
-    });
-  }
-
   if (cmd === '/stats' && String(from.id) === process.env.ADMIN_ID) {
-    return tg('sendMessage', { chat_id: chatId, text: `📊 Users: ${USERS.size}` });
+    const n = await userCount();
+    return tg('sendMessage', { chat_id: chatId, text: `📊 Users: ${n}` });
   }
 
   if (cmd === '/broadcast' && String(from.id) === process.env.ADMIN_ID) {
     const m = text.replace('/broadcast', '').trim();
     if (!m) return tg('sendMessage', { chat_id: chatId, text: 'Usage: /broadcast <msg>' });
+    const ids = await allIds();
     let sent = 0;
-    for (const u of USERS.values()) {
-      try { await tg('sendMessage', { chat_id: u.id, text: m }); sent++; } catch {}
+    for (const id of ids) {
+      try { await tg('sendMessage', { chat_id: id, text: m }); sent++; } catch {}
       await new Promise(r => setTimeout(r, 40));
     }
-    return tg('sendMessage', { chat_id: chatId, text: `📢 Sent to ${sent}/${USERS.size}` });
+    return tg('sendMessage', { chat_id: chatId, text: `📢 Sent to ${sent}/${ids.length}` });
   }
 }
 
@@ -253,10 +291,13 @@ async function handleBot(update) {
 // TASKS API
 // ============================================================
 async function handleTasks(body) {
+  if (!process.env.BOT_TOKEN) {
+    return { status: 500, data: { error: 'Server misconfigured: BOT_TOKEN missing' } };
+  }
   const u = verifyInitData(body.initData, process.env.BOT_TOKEN);
-  if (!u) return { status: 403, data: { error: 'Invalid auth' } };
+  if (!u) return { status: 403, data: { error: 'Invalid auth — reopen the app from Telegram' } };
 
-  const user = createUser(u);
+  const user = await getOrCreate(u);
   const action = body.action;
 
   if (action === 'list') {
@@ -270,6 +311,22 @@ async function handleTasks(body) {
   if (action === 'complete') {
     const t = TASKS.find(x => x.id === body.taskId);
     if (!t) return { status: 404, data: { error: 'Unknown task' } };
+
+    // ---- CHANNEL TASK: real verification ----
+    if (t.type === 'channel') {
+      const ch = await checkChannelMembership(user.id, t.channel);
+      if (!ch.ok) return { status: 400, data: { error: ch.error || 'Cannot verify. Try again.' } };
+      if (!ch.isMember) return { status: 400, data: { error: 'You have not joined yet. Join the channel, then come back.' } };
+    }
+
+    // ---- TIMER/LINK: client passes proof that it waited ----
+    if (t.type === 'timer' || t.type === 'link') {
+      const elapsed = Number(body.elapsed || 0);
+      const required = t.seconds || t.wait || 5;
+      if (elapsed < required) {
+        return { status: 400, data: { error: `You must wait ${required}s. Only ${Math.floor(elapsed)}s passed.` } };
+      }
+    }
 
     const s = taskStatus(user, t);
     if (!s.ready) return { status: 429, data: { error: 'Not ready yet', nextAt: s.nextAt } };
@@ -286,7 +343,7 @@ async function handleTasks(body) {
     user.balance += t.reward;
     user.xp += t.reward;
     user.level = Math.floor(user.xp / 500) + 1;
-    saveUser(user.id, user);
+    await saveUser(user.id, user);
     return { status: 200, data: { ok: true, user: publicUser(user), reward: t.reward } };
   }
 
@@ -298,7 +355,7 @@ async function handleTasks(body) {
 }
 
 // ============================================================
-// HTML — polished UI
+// HTML
 // ============================================================
 const HTML = () => `<!DOCTYPE html>
 <html lang="en">
@@ -311,95 +368,73 @@ const HTML = () => `<!DOCTYPE html>
 <link rel="apple-touch-icon" href="${LOGO_URL}" />
 <script src="https://telegram.org/js/telegram-web-app.js"><\/script>
 <style>
-:root{
-  --bg:#0b0e14; --card:#141924; --card2:#1a2030; --line:#232a3b;
-  --text:#eef2ff; --muted:#8f9bb3; --blue:#3b82f6; --blue2:#60a5fa;
-  --green:#22c55e; --gold:#facc15; --red:#ef4444; --radius:16px;
-}
+:root{--bg:#0b0e14;--card:#141924;--card2:#1a2030;--line:#232a3b;--text:#eef2ff;--muted:#8f9bb3;--blue:#3b82f6;--blue2:#60a5fa;--green:#22c55e;--gold:#facc15;--red:#ef4444}
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
-html,body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","Segoe UI",Roboto,sans-serif;min-height:100vh;overflow-x:hidden}
-body{
-  background:radial-gradient(1200px 600px at 50% -20%,rgba(59,130,246,.16),transparent 60%),var(--bg);
-  padding:14px 14px calc(20px + env(safe-area-inset-bottom));
-  padding-top:calc(14px + env(safe-area-inset-top));
-}
-.screen{max-width:520px;margin:0 auto}
-.hidden{display:none!important}
-
-/* Loader & blocked */
+html,body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","Segoe UI",Roboto,sans-serif;min-height:100vh}
+body{background:radial-gradient(1200px 600px at 50% -20%,rgba(59,130,246,.16),transparent 60%),var(--bg);padding:14px 14px calc(20px + env(safe-area-inset-bottom));padding-top:calc(14px + env(safe-area-inset-top))}
+.screen{max-width:520px;margin:0 auto}.hidden{display:none!important}
 .loader-wrap,.blocked-wrap{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:75vh;text-align:center;gap:16px;padding:24px}
 .loader-wrap img,.blocked-wrap img{width:88px;height:88px;border-radius:22px;object-fit:cover;box-shadow:0 10px 40px rgba(59,130,246,.35)}
 .spinner{width:42px;height:42px;border:3px solid rgba(255,255,255,.08);border-top-color:var(--blue);border-radius:50%;animation:spin .9s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
 .loader-wrap p,.blocked-wrap p{color:var(--muted);max-width:320px;line-height:1.5}
-
-/* Header */
 .header{display:flex;align-items:center;gap:12px;margin-bottom:14px}
-.header img{width:44px;height:44px;border-radius:12px;object-fit:cover;box-shadow:0 0 0 2px rgba(59,130,246,.35),0 6px 20px rgba(0,0,0,.4)}
+.header img{width:44px;height:44px;border-radius:12px;object-fit:cover;box-shadow:0 0 0 2px rgba(59,130,246,.35)}
 .header h1{font-size:19px;font-weight:800;line-height:1}
 .header small{display:block;color:var(--muted);font-size:12px;margin-top:3px}
-.pill{margin-left:auto;background:linear-gradient(135deg,var(--blue),var(--blue2));padding:6px 12px;border-radius:999px;font-size:12px;font-weight:700;color:#fff;box-shadow:0 4px 14px rgba(59,130,246,.4)}
-
-/* Stats */
+.pill{margin-left:auto;background:linear-gradient(135deg,var(--blue),var(--blue2));padding:6px 12px;border-radius:999px;font-size:12px;font-weight:700;color:#fff}
 .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:14px}
 .stat{background:linear-gradient(180deg,var(--card),var(--card2));border:1px solid var(--line);border-radius:14px;padding:12px 8px;text-align:center}
-.stat .v{font-size:19px;font-weight:800}
-.stat .l{font-size:10px;color:var(--muted);margin-top:3px;text-transform:uppercase;letter-spacing:.8px;font-weight:700}
-.stat.gold .v{color:var(--gold)} .stat.blue .v{color:var(--blue2)} .stat.green .v{color:var(--green)}
-
-.notice{font-size:11.5px;color:var(--muted);text-align:center;margin-bottom:12px;padding:8px 12px;background:rgba(59,130,246,.06);border:1px solid rgba(59,130,246,.12);border-radius:10px;line-height:1.5}
-
-/* Filters */
-.filters{display:flex;gap:6px;overflow-x:auto;margin-bottom:12px;padding-bottom:4px;scrollbar-width:none}
-.filters::-webkit-scrollbar{display:none}
-.chip{padding:8px 14px;border:1px solid var(--line);background:var(--card);color:var(--muted);border-radius:999px;font-size:12px;font-weight:600;white-space:nowrap;cursor:pointer;transition:.15s}
-.chip.active{background:linear-gradient(135deg,var(--blue),var(--blue2));color:#fff;border-color:transparent;box-shadow:0 4px 12px rgba(59,130,246,.35)}
-
-/* Tabs */
+.stat .v{font-size:19px;font-weight:800}.stat .l{font-size:10px;color:var(--muted);margin-top:3px;text-transform:uppercase;letter-spacing:.8px;font-weight:700}
+.stat.gold .v{color:var(--gold)}.stat.blue .v{color:var(--blue2)}.stat.green .v{color:var(--green)}
+.notice{font-size:11.5px;color:var(--muted);text-align:center;margin-bottom:12px;padding:8px 12px;background:rgba(59,130,246,.06);border:1px solid rgba(59,130,246,.12);border-radius:10px}
 .tabs{display:flex;gap:4px;background:var(--card);padding:5px;border-radius:14px;margin-bottom:12px;border:1px solid var(--line)}
-.tab{flex:1;padding:9px 6px;border:none;border-radius:10px;background:transparent;color:var(--muted);font-size:12px;font-weight:700;cursor:pointer;transition:.15s}
-.tab.active{background:linear-gradient(135deg,var(--blue),var(--blue2));color:#fff;box-shadow:0 4px 12px rgba(59,130,246,.3)}
-
-/* Task cards */
+.tab{flex:1;padding:9px 6px;border:none;border-radius:10px;background:transparent;color:var(--muted);font-size:12px;font-weight:700;cursor:pointer}
+.tab.active{background:linear-gradient(135deg,var(--blue),var(--blue2));color:#fff}
 .task-list{display:flex;flex-direction:column;gap:10px}
 .task{background:linear-gradient(180deg,var(--card),var(--card2));border:1px solid var(--line);border-radius:14px;padding:14px;display:flex;align-items:center;gap:12px;position:relative;overflow:hidden}
 .task::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:linear-gradient(180deg,var(--blue),var(--blue2))}
 .task.ready::before{background:linear-gradient(180deg,var(--green),#4ade80)}
-.task.locked{opacity:.72}
-.task.done{opacity:.55}
+.task.locked{opacity:.72}.task.done{opacity:.55}
 .task .icon{width:42px;height:42px;border-radius:12px;background:rgba(59,130,246,.14);display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0}
 .task.ready .icon{background:rgba(34,197,94,.15)}
-.task.done .icon{background:rgba(143,155,179,.15)}
 .task .body{flex:1;min-width:0}
 .task .title{font-size:14px;font-weight:700;margin-bottom:2px}
 .task .desc{font-size:11.5px;color:var(--muted);line-height:1.4}
-.task .meta{font-size:11px;color:var(--gold);font-weight:700;margin-top:5px;display:flex;gap:8px;align-items:center}
-.task .meta .badge{background:rgba(59,130,246,.15);color:var(--blue2);padding:2px 7px;border-radius:6px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.5px}
-.task .btn{padding:9px 14px;border:none;border-radius:10px;background:linear-gradient(135deg,var(--blue),var(--blue2));color:#fff;font-size:12px;font-weight:700;cursor:pointer;white-space:nowrap;box-shadow:0 4px 12px rgba(59,130,246,.3);transition:.15s;min-width:82px;text-align:center}
+.task .meta{font-size:11px;color:var(--gold);font-weight:700;margin-top:5px}
+.task .btn{padding:9px 14px;border:none;border-radius:10px;background:linear-gradient(135deg,var(--blue),var(--blue2));color:#fff;font-size:12px;font-weight:700;cursor:pointer;white-space:nowrap;min-width:82px;text-align:center}
 .task .btn:active{transform:scale(.95)}
-.task .btn:disabled{background:#232a3b;color:var(--muted);box-shadow:none;cursor:default}
-.task .btn.done{background:rgba(34,197,94,.15);color:var(--green);box-shadow:none}
-.task .btn.locked{background:rgba(143,155,179,.12);color:var(--muted);box-shadow:none;font-variant-numeric:tabular-nums}
-
+.task .btn:disabled{background:#232a3b;color:var(--muted);cursor:default}
+.task .btn.done{background:rgba(34,197,94,.15);color:var(--green)}
+.task .btn.locked{background:rgba(143,155,179,.12);color:var(--muted);font-variant-numeric:tabular-nums}
 .card{background:linear-gradient(180deg,var(--card),var(--card2));border:1px solid var(--line);border-radius:14px;padding:18px;margin-bottom:12px}
 .card h2{font-size:16px;font-weight:800;margin-bottom:8px}
 .card p{font-size:13px;color:var(--muted);line-height:1.55;margin-bottom:14px}
-.btn-primary{width:100%;padding:14px;border:none;border-radius:12px;background:linear-gradient(135deg,var(--blue),var(--blue2));color:#fff;font-size:14px;font-weight:700;cursor:pointer;box-shadow:0 6px 20px rgba(59,130,246,.35);transition:.15s}
-.btn-primary:active{transform:scale(.98)}
-.btn-primary:disabled{opacity:.55;cursor:default;box-shadow:none}
-.btn-ghost{display:block;width:100%;padding:13px;border:1px solid var(--line);border-radius:12px;background:var(--card);color:var(--text);font-size:13px;font-weight:600;cursor:pointer;text-align:center;text-decoration:none}
-.invite-box{background:#0a0d14;border:1px dashed var(--line);border-radius:12px;padding:12px;font-size:11.5px;color:var(--blue2);word-break:break-all;text-align:center;margin:10px 0;font-family:ui-monospace,Menlo,monospace;line-height:1.5}
+.btn-primary{width:100%;padding:14px;border:none;border-radius:12px;background:linear-gradient(135deg,var(--blue),var(--blue2));color:#fff;font-size:14px;font-weight:700;cursor:pointer}
+.btn-primary:disabled{opacity:.55;cursor:default}
+.btn-ghost{display:block;width:100%;padding:13px;border:1px solid var(--line);border-radius:12px;background:var(--card);color:var(--text);font-size:13px;font-weight:600;text-align:center;text-decoration:none}
+.invite-box{background:#0a0d14;border:1px dashed var(--line);border-radius:12px;padding:12px;font-size:11.5px;color:var(--blue2);word-break:break-all;text-align:center;margin:10px 0;font-family:ui-monospace,Menlo,monospace}
 .profile-row{display:flex;justify-content:space-between;padding:11px 0;border-bottom:1px solid var(--line);font-size:13px}
-.profile-row:last-child{border-bottom:none}
-.profile-row span:first-child{color:var(--muted)}
-.profile-row span:last-child{font-weight:700}
+.profile-row:last-child{border-bottom:none}.profile-row span:first-child{color:var(--muted)}.profile-row span:last-child{font-weight:700}
 a{color:var(--blue2);text-decoration:none}
-
-/* Toast */
 .toast{position:fixed;left:50%;bottom:calc(20px + env(safe-area-inset-bottom));transform:translateX(-50%) translateY(20px);background:#141924;border:1px solid var(--line);color:#fff;padding:12px 18px;border-radius:12px;font-size:13px;font-weight:600;box-shadow:0 10px 30px rgba(0,0,0,.6);opacity:0;pointer-events:none;transition:.3s;z-index:999;max-width:90vw;text-align:center}
 .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
 .toast.success{border-color:rgba(34,197,94,.4);color:#86efac}
 .toast.error{border-color:rgba(239,68,68,.4);color:#fca5a5}
+
+/* Modal */
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.75);backdrop-filter:blur(6px);display:flex;align-items:center;justify-content:center;padding:20px;z-index:1000}
+.modal .box{background:linear-gradient(180deg,#141924,#1a2030);border:1px solid var(--line);border-radius:18px;padding:22px;max-width:380px;width:100%;text-align:center}
+.modal .box h3{font-size:18px;font-weight:800;margin-bottom:8px}
+.modal .box p{font-size:13px;color:var(--muted);line-height:1.5;margin-bottom:16px}
+.progress{height:10px;background:#0a0d14;border-radius:999px;overflow:hidden;margin:16px 0;border:1px solid var(--line)}
+.progress .bar{height:100%;background:linear-gradient(90deg,var(--blue),var(--blue2));border-radius:999px;width:0%;transition:width 1s linear}
+.timer-text{font-size:32px;font-weight:800;color:var(--blue2);font-variant-numeric:tabular-nums}
+.modal-btns{display:flex;gap:8px;margin-top:12px}
+.modal-btns button{flex:1;padding:12px;border:none;border-radius:12px;font-size:13px;font-weight:700;cursor:pointer}
+.modal-btns .ok{background:linear-gradient(135deg,var(--blue),var(--blue2));color:#fff}
+.modal-btns .ok:disabled{opacity:.5;cursor:default}
+.modal-btns .cancel{background:#232a3b;color:var(--text)}
 </style>
 </head>
 <body>
@@ -439,15 +474,6 @@ a{color:var(--blue2);text-decoration:none}
   </nav>
 
   <section id="tab-tasks" class="tab-panel">
-    <div class="filters" id="filters">
-      <button class="chip active" data-f="all">All</button>
-      <button class="chip" data-f="ready">Ready</button>
-      <button class="chip" data-f="once">Once</button>
-      <button class="chip" data-f="daily">Daily</button>
-      <button class="chip" data-f="cooldown">Repeatable</button>
-      <button class="chip" data-f="unlimited">Unlimited</button>
-      <button class="chip" data-f="done">Done</button>
-    </div>
     <div class="task-list" id="taskList"></div>
   </section>
 
@@ -472,7 +498,7 @@ a{color:var(--blue2);text-decoration:none}
     </div>
     <div class="card">
       <h2>ℹ️ About</h2>
-      <p>${APP_NAME} is a Telegram Mini App for entertainment. NL has no monetary value and cannot be withdrawn, sold, or exchanged.</p>
+      <p>${APP_NAME} is a Telegram Mini App for entertainment. NL has no monetary value.</p>
       <a href="/api/about" class="btn-ghost">Read full About & Privacy</a>
     </div>
   </section>
@@ -486,15 +512,13 @@ const initData = tg?.initData;
 const $ = (id) => document.getElementById(id);
 const screen = (el) => { document.querySelectorAll('.screen').forEach(s=>s.classList.add('hidden')); el.classList.remove('hidden'); };
 
-let USER = null, TASKS = [], FILTER = 'all';
-const TICK = setInterval(tick, 1000);
+let USER = null, TASKS = [];
+setInterval(tick, 1000);
 
 function toast(msg, type='') {
-  const t = $('toast');
-  t.textContent = msg;
-  t.className = 'toast show ' + type;
+  const t = $('toast'); t.textContent = msg; t.className = 'toast show ' + type;
   clearTimeout(toast._t);
-  toast._t = setTimeout(()=>t.className='toast '+type, 2400);
+  toast._t = setTimeout(()=>t.className='toast '+type, 2600);
 }
 function fmt(ms) {
   if (ms <= 0) return '';
@@ -504,7 +528,6 @@ function fmt(ms) {
   if (h > 0) return h + 'h ' + (m%60) + 'm';
   return m + 'm ' + (s%60) + 's';
 }
-
 async function api(action, extra={}) {
   try {
     const r = await fetch('/api/tasks', {
@@ -530,33 +553,9 @@ function renderUser(u) {
   $('pTasks').textContent = Object.values(u.tasks || {}).reduce((a,t)=>a+(t.count||0),0);
 }
 
-function typeLabel(t) {
-  if (t.type === 'once') return { text: 'Once', cls: '' };
-  if (t.type === 'daily') return { text: 'Daily', cls: '' };
-  if (t.type === 'cooldown') return { text: 'Repeatable', cls: '' };
-  if (t.type === 'unlimited') return { text: 'Unlimited', cls: '' };
-  return { text: '', cls: '' };
-}
-
 function renderTasks() {
-  const list = $('taskList');
-  list.innerHTML = '';
-
-  let items = TASKS.slice();
-  if (FILTER === 'ready')      items = items.filter(t => t.ready);
-  else if (FILTER === 'done')  items = items.filter(t => t.done);
-  else if (FILTER === 'once')  items = items.filter(t => t.type === 'once');
-  else if (FILTER === 'daily') items = items.filter(t => t.type === 'daily');
-  else if (FILTER === 'cooldown')  items = items.filter(t => t.type === 'cooldown');
-  else if (FILTER === 'unlimited') items = items.filter(t => t.type === 'unlimited');
-
-  if (!items.length) {
-    list.innerHTML = '<div class="card" style="text-align:center"><p style="margin:0">No tasks in this category right now.</p></div>';
-    return;
-  }
-
-  items.forEach(t => {
-    const label = typeLabel(t);
+  const list = $('taskList'); list.innerHTML = '';
+  TASKS.forEach(t => {
     const el = document.createElement('div');
     const cls = t.done ? 'task done' : (t.ready ? 'task ready' : 'task locked');
     el.className = cls;
@@ -566,43 +565,49 @@ function renderTasks() {
       '<div class="body">' +
         '<div class="title">' + t.title + '</div>' +
         '<div class="desc">' + t.desc + '</div>' +
-        '<div class="meta">+' + t.reward + ' NL ' +
-          '<span class="badge">' + label.text + '</span>' +
-          (t.count ? '<span style="color:var(--muted)">· done ' + t.count + 'x</span>' : '') +
-        '</div>' +
+        '<div class="meta">+' + t.reward + ' NL' + (t.count ? ' · done ' + t.count + 'x' : '') + '</div>' +
       '</div>' +
       '<button class="btn" data-id="' + t.id + '"></button>';
-    const btn = el.querySelector('button');
-    btn.onclick = () => handleTask(t);
+    el.querySelector('button').onclick = () => handleTask(t);
     list.appendChild(el);
-    refreshBtn(btn, t);
+    refreshBtn(el.querySelector('button'), t);
   });
 }
-
 function refreshBtn(btn, t) {
   if (t.done) { btn.disabled = true; btn.className = 'btn done'; btn.textContent = 'Done'; return; }
   if (t.ready) {
-    btn.disabled = false;
-    btn.className = 'btn';
-    btn.textContent = t.type === 'once' ? 'Claim' : (t.type === 'daily' ? 'Claim' : 'Start');
+    btn.disabled = false; btn.className = 'btn';
+    btn.textContent = t.type === 'channel' ? 'Verify' : (t.type === 'timer' ? 'Start' : (t.type === 'link' ? 'Open' : 'Claim'));
     return;
   }
-  btn.disabled = true;
-  btn.className = 'btn locked';
+  btn.disabled = true; btn.className = 'btn locked';
   btn.textContent = fmt((t.nextAt || 0) - Date.now());
 }
 
+// -------- REAL task performance --------
 async function handleTask(t) {
-  // For link tasks: open URL first, then credit
-  if (t.url) {
-    try { tg?.openLink?.(t.url) || window.open(t.url, '_blank'); } catch { window.open(t.url, '_blank'); }
-    await new Promise(r => setTimeout(r, 800));
+  if (t.type === 'channel') {
+    // open the channel, then verify
+    const channelUrl = 'https://t.me/' + (t.channel || '').replace('@','');
+    try { tg?.openTelegramLink?.(channelUrl) || window.open(channelUrl, '_blank'); } catch { window.open(channelUrl, '_blank'); }
+    // small delay so user can switch back
+    setTimeout(async () => {
+      const r = await api('complete', { taskId: t.id });
+      if (r.ok) { toast('+' + r.reward + ' NL', 'success'); renderUser(r.user); await loadTasks(); }
+      else toast(r.error || 'Verification failed', 'error');
+    }, 1500);
+    return;
   }
-  // For timer tasks: small delay to feel real
-  if (t.type === 'cooldown' && (t.id.includes('stay') || t.id.includes('browse'))) {
-    toast('Verifying…');
-    await new Promise(r => setTimeout(r, 1200));
+
+  if (t.type === 'timer') {
+    return runTimerTask(t);
   }
+
+  if (t.type === 'link') {
+    return runLinkTask(t);
+  }
+
+  // instant / unlimited
   const r = await api('complete', { taskId: t.id });
   if (r.ok) {
     tg?.HapticFeedback?.notificationOccurred('success');
@@ -615,27 +620,123 @@ async function handleTask(t) {
   }
 }
 
+// ---- TIMER: user must actually wait ----
+function runTimerTask(t) {
+  const secs = t.seconds || 30;
+  let left = secs;
+  const start = Date.now();
+  const modal = document.createElement('div');
+  modal.className = 'modal';
+  modal.innerHTML =
+    '<div class="box">' +
+      '<h3>' + t.icon + ' ' + t.title + '</h3>' +
+      '<p>Keep this open. The reward unlocks when the timer ends.</p>' +
+      '<div class="timer-text" id="tt">' + left + 's</div>' +
+      '<div class="progress"><div class="bar" id="tb"></div></div>' +
+      '<div class="modal-btns">' +
+        '<button class="cancel" id="mc">Cancel</button>' +
+        '<button class="ok" id="mo" disabled>Verifying…</button>' +
+      '</div>' +
+    '</div>';
+  document.body.appendChild(modal);
+  const bar = modal.querySelector('#tb');
+  const tt = modal.querySelector('#tt');
+  const ok = modal.querySelector('#mo');
+
+  const iv = setInterval(async () => {
+    left--;
+    tt.textContent = Math.max(0,left) + 's';
+    bar.style.width = ((secs - Math.max(0,left))/secs*100) + '%';
+    if (left <= 0) {
+      clearInterval(iv);
+      ok.disabled = false;
+      ok.textContent = 'Claim ' + t.reward + ' NL';
+      ok.onclick = async () => {
+        const elapsed = (Date.now() - start) / 1000;
+        const r = await api('complete', { taskId: t.id, elapsed });
+        modal.remove();
+        if (r.ok) {
+          tg?.HapticFeedback?.notificationOccurred('success');
+          toast('+' + r.reward + ' NL', 'success');
+          renderUser(r.user);
+          await loadTasks();
+        } else toast(r.error || 'Failed', 'error');
+      };
+    }
+  }, 1000);
+
+  modal.querySelector('#mc').onclick = () => { clearInterval(iv); modal.remove(); };
+}
+
+// ---- LINK: open URL, wait, then verify ----
+function runLinkTask(t) {
+  const secs = t.wait || 5;
+  let left = secs;
+  const start = Date.now();
+  try { tg?.openLink?.(t.url) || window.open(t.url, '_blank'); } catch { window.open(t.url, '_blank'); }
+
+  const modal = document.createElement('div');
+  modal.className = 'modal';
+  modal.innerHTML =
+    '<div class="box">' +
+      '<h3>' + t.icon + ' ' + t.title + '</h3>' +
+      '<p>Link opened in your browser. Come back and wait for verification.</p>' +
+      '<div class="timer-text" id="tt">' + left + 's</div>' +
+      '<div class="progress"><div class="bar" id="tb"></div></div>' +
+      '<div class="modal-btns">' +
+        '<button class="cancel" id="mc">Cancel</button>' +
+        '<button class="ok" id="mo" disabled>Verifying…</button>' +
+      '</div>' +
+    '</div>';
+  document.body.appendChild(modal);
+  const bar = modal.querySelector('#tb');
+  const tt = modal.querySelector('#tt');
+  const ok = modal.querySelector('#mo');
+
+  const iv = setInterval(async () => {
+    left--;
+    tt.textContent = Math.max(0,left) + 's';
+    bar.style.width = ((secs - Math.max(0,left))/secs*100) + '%';
+    if (left <= 0) {
+      clearInterval(iv);
+      ok.disabled = false;
+      ok.textContent = 'Verify & claim ' + t.reward + ' NL';
+      ok.onclick = async () => {
+        const elapsed = (Date.now() - start) / 1000;
+        const r = await api('complete', { taskId: t.id, elapsed });
+        modal.remove();
+        if (r.ok) {
+          tg?.HapticFeedback?.notificationOccurred('success');
+          toast('+' + r.reward + ' NL', 'success');
+          renderUser(r.user);
+          await loadTasks();
+        } else toast(r.error || 'Failed', 'error');
+      };
+    }
+  }, 1000);
+
+  modal.querySelector('#mc').onclick = () => { clearInterval(iv); modal.remove(); };
+}
+
 async function loadTasks() {
   const d = await api('list');
-  if (d.error) return toast(d.error, 'error');
+  if (d.error) { toast(d.error, 'error'); return; }
   TASKS = d.tasks;
   renderUser(d.user);
   renderTasks();
 }
-
 function tick() {
   if (!TASKS.length) return;
-  let needs = false;
+  let refresh = false;
   TASKS.forEach(t => {
-    if (!t.done && !t.ready) {
-      if ((t.nextAt || 0) <= Date.now()) { t.ready = true; t.nextAt = 0; needs = true; }
-      else {
-        const btn = document.querySelector('.task[data-id="' + t.id + '"] .btn');
-        if (btn) btn.textContent = fmt(t.nextAt - Date.now());
-      }
+    if (!t.done && !t.ready && (t.nextAt || 0) <= Date.now()) {
+      t.ready = true; t.nextAt = 0; refresh = true;
+    } else if (!t.done && !t.ready) {
+      const btn = document.querySelector('.task[data-id="' + t.id + '"] .btn');
+      if (btn) btn.textContent = fmt(t.nextAt - Date.now());
     }
   });
-  if (needs) renderTasks();
+  if (refresh) renderTasks();
 }
 
 async function init() {
@@ -645,7 +746,7 @@ async function init() {
 
   try {
     const r = await api('profile');
-    if (r.error) return screen($('blocked'));
+    if (r.error) { toast(r.error, 'error'); return screen($('blocked')); }
     renderUser(r.user);
     await loadTasks();
     screen($('app'));
@@ -659,15 +760,6 @@ async function init() {
       $('tab-'+btn.dataset.tab).classList.remove('hidden');
     };
   });
-  document.querySelectorAll('.chip').forEach(c=>{
-    c.onclick = () => {
-      document.querySelectorAll('.chip').forEach(x=>x.classList.remove('active'));
-      c.classList.add('active');
-      FILTER = c.dataset.f;
-      renderTasks();
-    };
-  });
-
   $('copyInvite').onclick = async () => {
     const r = await api('profile');
     const link = 'https://t.me/${BOT_USERNAME}?start=ref_' + r.user.id;
@@ -682,37 +774,19 @@ window.addEventListener('load', init);
 </html>`;
 
 const ABOUT = () => `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>About · ${APP_NAME}</title>
-<link rel="icon" type="image/jpeg" href="${LOGO_URL}" />
-<style>
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0b0e14;color:#eef2ff;padding:24px;line-height:1.65;max-width:640px;margin:0 auto}
-.brand{display:flex;align-items:center;gap:12px;margin-bottom:16px}
-.brand img{width:56px;height:56px;border-radius:14px}
-h1{font-size:22px;margin:0}
-h2{font-size:15px;margin:20px 0 6px;color:#60a5fa}
-a{color:#60a5fa}
-</style>
-</head>
-<body>
-<div class="brand"><img src="${LOGO_URL}" /><h1>About ${APP_NAME}</h1></div>
+<html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>About · ${APP_NAME}</title><link rel="icon" type="image/jpeg" href="${LOGO_URL}" />
+<style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0b0e14;color:#eef2ff;padding:24px;line-height:1.65;max-width:640px;margin:0 auto}
+.brand{display:flex;align-items:center;gap:12px;margin-bottom:16px}.brand img{width:56px;height:56px;border-radius:14px}
+h1{font-size:22px;margin:0}h2{font-size:15px;margin:20px 0 6px;color:#60a5fa}a{color:#60a5fa}</style></head>
+<body><div class="brand"><img src="${LOGO_URL}" /><h1>About ${APP_NAME}</h1></div>
 <p>${APP_NAME} is a Telegram Mini App for entertainment. Users complete simple in-app tasks to earn "NL", a virtual progression token used only inside the app.</p>
-<h2>Points Policy</h2>
-<p>NL has <b>no monetary value</b>. It cannot be withdrawn, sold, traded, or exchanged for cash, crypto, or goods.</p>
-<h2>Advertising</h2>
-<p>${APP_NAME} displays optional rewarded ads. Watching ads is always a choice and never required to use the app.</p>
-<h2>Data</h2>
-<p>We store your Telegram user ID, username, and in-app progress. We do not store messages, contacts, or payment information.</p>
-<h2>Content</h2>
-<p>${APP_NAME} contains no adult content, gambling, real-money rewards, or financial services.</p>
-<h2>Contact</h2>
-<p>Bot: <a href="https://t.me/${BOT_USERNAME}">@${BOT_USERNAME}</a></p>
-<p><a href="/">← Back to app</a></p>
-</body>
-</html>`;
+<h2>Points Policy</h2><p>NL has <b>no monetary value</b>. It cannot be withdrawn, sold, traded, or exchanged for cash, crypto, or goods.</p>
+<h2>Advertising</h2><p>${APP_NAME} displays optional rewarded ads. Watching ads is always a choice and never required to use the app.</p>
+<h2>Data</h2><p>We store your Telegram user ID, username, and in-app progress. We do not store messages, contacts, or payment information.</p>
+<h2>Content</h2><p>${APP_NAME} contains no adult content, gambling, real-money rewards, or financial services.</p>
+<h2>Contact</h2><p>Bot: <a href="https://t.me/${BOT_USERNAME}">@${BOT_USERNAME}</a></p>
+<p><a href="/">← Back to app</a></p></body></html>`;
 
 // ============================================================
 // NETLIFY HANDLER
@@ -731,7 +805,19 @@ exports.handler = async (event) => {
       const body = JSON.parse(event.body || '{}');
       const { status, data } = await handleTasks(body);
       return json(status, data);
-    } catch { return json(400, { error: 'Bad request' }); }
+    } catch (e) { return json(500, { error: 'Server error', detail: String(e) }); }
+  }
+
+  if (path === '/api/debug') {
+    return json(200, {
+      botTokenSet: !!process.env.BOT_TOKEN,
+      adminIdSet: !!process.env.ADMIN_ID,
+      webappUrl: process.env.WEBAPP_URL || '(not set)',
+      redisConfigured: HAS_REDIS,
+      userCount: await userCount(),
+      tasksCount: TASKS.length,
+      channels: CHANNELS,
+    });
   }
 
   if (path === '/api/ads') {
