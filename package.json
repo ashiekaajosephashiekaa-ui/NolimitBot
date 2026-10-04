@@ -1,0 +1,13 @@
+{
+  "name": "nolimit-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "NooLimit Telegram bot — entertainment Mini App alternative",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
